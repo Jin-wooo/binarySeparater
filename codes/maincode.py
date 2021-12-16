@@ -28,6 +28,8 @@ from sklearn.metrics import accuracy_score
 from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import RFE
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 
 # 로컬에서 작동시키는 것을 전제로 만들었습니다.
 # from google.colab import drive
@@ -121,7 +123,7 @@ class EmberParser:
 
     def __init__(self, path):
         self.report = read_json(path)
-        self.vector = []
+        self.strlist = []
 
     def get_histogram_info(self):
         histogram = np.array(self.report["histogram"])
@@ -155,15 +157,38 @@ class EmberParser:
         ]
         return vector
 
+    def get_section_info(self):
+        # 나머지는 비슷하거나 영향이 미미하므로 "characteristics"만 가져옴
+        section = self.report["section"]["sections"]
+        vector = []
+        for i in section:
+            self.strlist.append(i["name"])  # String
+            self.strlist.extend(i["props"])  # List
+
+            vector.extend([i["size"], i["entropy"], i["vsize"]])
+        return vector
+
+    def get_import_info(self):
+        imports = self.report["imports"]
+        for i in list(imports.keys()):
+            self.strlist.append(i)
+            self.strlist.extend(imports[i])
+
+    def get_export_info(self):
+        exports = self.report["exports"]
+        self.strlist.extend(exports)
+
     def process_report(self):
         vector = []
         vector += self.get_general_file_info()
         vector += self.get_histogram_info()
         vector += self.get_string_info()
-        '''
-            특징 추가
-        '''
-        return vector
+
+        # Add features
+        vector += self.get_section_info()
+        self.get_import_info()
+
+        return vector, self.strlist
 
 
 class PestudioParser:
@@ -227,8 +252,10 @@ def process1(path_l, peminer, ember, pestudio):
     a.extend(b)
     a.extend(c)
     all_files = set(a)
+    tf = TfidfVectorizer(analyzer="char", ngram_range=(3, 3))
     for fname in list(all_files):
         feature_vector = []
+        strlist = ""
         lname = fname.split('.')[0]
         label = label_table[lname]
         for data in [peminer, ember, pestudio]:
@@ -237,13 +264,16 @@ def process1(path_l, peminer, ember, pestudio):
                 if data == peminer:
                     feature_vector += PeminerParser(path).process_report()
                 elif data == ember:
-                    feature_vector += EmberParser(path).process_report()
+                    feature_vector, strlist = EmberParser(path).process_report()
+                    tmp = tf.fit_transform(strlist)
+                    feature_vector += tmp
                 else:
                     feature_vector += PestudioParser(path).process_report()
             except FileNotFoundError:
                 pass
             except TypeError:
                 print(path)
+
         V.append(feature_vector)
         w.append(label)
     print(np.asarray(V).shape, np.asarray(w).shape)
@@ -299,42 +329,43 @@ def select_feature(X, y, model):
     return rfe.fit_transform(X, y)
 
 
-SEED = 41
-datapath = "../../../../Data/"
+if __name__ == '__main__':
+    SEED = 41
+    datapath = "../../../../Data/"
 
-trainlabel = datapath + "학습데이터_정답.csv"
-checklable = datapath + "검증데이터_정답.csv"
+    trainlabel = datapath + "학습데이터_정답.csv"
+    checklable = datapath + "검증데이터_정답.csv"
 
-# Path for test data
-peminer = datapath + "PEMINER/테스트데이터"
-ember = datapath + "EMBER/테스트데이터"
-pestudio = datapath + "PESTUDIO/테스트데이터"
+    # Path for test data
+    peminer = datapath + "PEMINER/테스트데이터"
+    ember = datapath + "EMBER/테스트데이터"
+    pestudio = datapath + "PESTUDIO/테스트데이터"
 
-# Path for check data
-check_peminer = datapath + "PEMINER/검증데이터"
-check_ember = datapath + "EMBER/검증데이터"
-check_pestudio = datapath + "PESTUDIO/검증데이터"
+    # Path for check data
+    check_peminer = datapath + "PEMINER/검증데이터"
+    check_ember = datapath + "EMBER/검증데이터"
+    check_pestudio = datapath + "PESTUDIO/검증데이터"
 
-# Path for train data
-train_peminer = datapath + "PEMINER/학습데이터"
-train_ember = datapath + "EMBER/학습데이터"
-train_pestudio = datapath + "PESTUDIO/학습데이터"
+    # Path for train data
+    train_peminer = datapath + "PEMINER/학습데이터"
+    train_ember = datapath + "EMBER/학습데이터"
+    train_pestudio = datapath + "PESTUDIO/학습데이터"
 
-# %%
-X, y = process1(trainlabel, train_peminer, train_ember, train_pestudio)
-"""## 학습 및 검증"""
-# %%
-# 학습
-models = []
-for model in ["rf", "lgb"]:
-    clf = train(X, y, model)
-    models.append(clf)
+    # %%
+    X, y = process1(trainlabel, train_peminer, train_ember, train_pestudio)
+    """## 학습 및 검증"""
+    # %%
+    # 학습
+    models = []
+    for model in ["rf", "lgb"]:
+        clf = train(X, y, model)
+        models.append(clf)
 
-# 검증
-# 실제 검증 시에는 제공한 검증데이터를 검증에 사용해야 함
-for model in models:
-    evaluate(X, y, model)
-ensemble_result(X, y, models)
+    # 검증
+    # 실제 검증 시에는 제공한 검증데이터를 검증에 사용해야 함
+    for model in models:
+        evaluate(X, y, model)
+    ensemble_result(X, y, models)
 
-selected_X = select_feature(X, y, "rf")
-new_model = train(selected_X, y, "rf")
+    selected_X = select_feature(X, y, "rf")
+    new_model = train(selected_X, y, "rf")
