@@ -13,6 +13,7 @@ import json
 import pprint
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from lightgbm import LGBMClassifier
 
@@ -29,7 +30,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.feature_selection import RFE
 
 from sklearn.feature_extraction.text import TfidfVectorizer
-
+import hashlib
+from xgboost import XGBClassifier
+import csv
 
 # 로컬에서 작동시키는 것을 전제로 만들었습니다.
 # from google.colab import drive
@@ -39,7 +42,6 @@ def read_label_csv(path):
     label_table = dict()
     with open(path, "r") as f:
         for line in f.readlines()[1:]:
-
             fname, label = line.strip().split(",")
             label_table[fname] = int(label)
     return label_table
@@ -67,6 +69,8 @@ def load_model(**kwargs):
         return AdaBoostClassifier(random_state=kwargs["random_state"])
     elif kwargs["model"] == "mlp":
         return MLPClassifier(random_state=kwargs["random_state"])
+    elif kwargs["model"] == "xg":
+        return XGBClassifier(random_state=kwargs["random_state"])
     else:
         print("Unsupported Algorithm")
         return None
@@ -75,6 +79,7 @@ def load_model(**kwargs):
 def train(X_train, y_train, model):
     """
         머신러닝 모델을 선택하여 학습을 진행하는 함수
+
         :param X_train: 학습할 2차원 리스트 특징벡터
         :param y_train: 학습할 1차원 리스트 레이블 벡터
         :param model: 문자열, 선택할 머신러닝 알고리즘
@@ -124,6 +129,7 @@ class EmberParser:
     def __init__(self, path):
         self.report = read_json(path)
         self.strlist = []
+        self.hasher = hashlib.new("md5")
 
     def get_histogram_info(self):
         histogram = np.array(self.report["histogram"])
@@ -160,19 +166,45 @@ class EmberParser:
     def get_section_info(self):
         # 나머지는 비슷하거나 영향이 미미하므로 "characteristics"만 가져옴
         section = self.report["section"]["sections"]
-        vector = []
-        for i in section:
-            self.strlist.append(i["name"])  # String
-            self.strlist.extend(i["props"])  # List
+        name_size = 20
+        props_size = 45
+        name_vec = [0 for i in range(name_size)]
+        props_vec = [0 for i in range(props_size)]
 
-            vector.extend([i["size"], i["entropy"], i["vsize"]])
+        size_sum, ent_sum, vs_sum = 0, 0, 0
+        if len(section) == 0:
+            print('EMP')
+        for i in section:
+            if not i["name"] == "":
+                self.hasher.update(i["name"].encode("UTF-8"))  # String
+                name_vec[int(self.hasher.hexdigest(), 16) % name_size] += 1
+                for h in i["props"]:
+                    self.hasher.update(h.encode("UTF-8"))  # String
+                    props_vec[int(self.hasher.hexdigest(), 16) % props_size] += 1
+
+            size_sum += i["size"]
+            ent_sum += i["entropy"]
+            vs_sum += i["vsize"]
+        size_sum = size_sum / len(section) if size_sum > 0 else 0
+        ent_sum = ent_sum / len(section) if ent_sum > 0 else 0
+        vs_sum = vs_sum / len(section) if vs_sum > 0 else 0
+        vector = [size_sum, ent_sum, vs_sum]
+        vector.extend(name_vec)
+        vector.extend(props_vec)
+
         return vector
 
     def get_import_info(self):
         imports = self.report["imports"]
-        for i in list(imports.keys()):
-            self.strlist.append(i)
-            self.strlist.extend(imports[i])
+        imp_size = 20
+        imp_vec = [0 for i in range(imp_size)]
+        for i in imports:
+            for j in i:
+                self.hasher.update(j.encode("UTF-8"))  # String
+                imp_vec[int(self.hasher.hexdigest(), 16) % imp_size] += 1
+
+        return imp_vec
+
 
     def get_export_info(self):
         exports = self.report["exports"]
@@ -187,8 +219,9 @@ class EmberParser:
         # Add features
         vector += self.get_section_info()
         self.get_import_info()
+        vector.extend(self.strlist)
 
-        return vector, self.strlist
+        return vector
 
 
 class PestudioParser:
@@ -198,10 +231,37 @@ class PestudioParser:
 
     def __init__(self, path):
         self.report = read_json(path)
-        self.vector = []
+        self.hasher = hashlib.new("md5")
+
+    def get_overview_info(self):
+        overview = self.report["image"]["overview"]
+        self.hasher.update(overview["size"].encode("UTF-8"))
+        vector = [int(self.hasher.hexdigest(), 16) % 10, float(overview["entropy"])]
+        return vector
+
+    def get_library_info(self):
+        lib_vec = [0 for j in range(20)]
+        try:
+            library = self.report["image"]["libraries"]["library"]
+        except KeyError:
+            return lib_vec
+        if type(library) == dict:
+            self.hasher.update(library["@name"].encode("UTF-8"))  # String
+            lib_vec[int(self.hasher.hexdigest(), 16) % 20] += 1
+        else:
+            for i in library:
+                self.hasher.update(str(i["@name"]).encode("UTF-8"))  # String
+                lib_vec[int(self.hasher.hexdigest(), 16) % 20] += 1
+
+
+        return lib_vec
 
     def process_report(self):
-        pass
+        vector = []
+        vector += self.get_overview_info()
+        vector += self.get_library_info()
+
+        return vector
 
 
 """## 학습데이터 구성
@@ -242,8 +302,9 @@ class PestudioParser:
 """
 
 
-def process1(path_l, peminer, ember, pestudio):
-    V, w = [], []
+# 원본
+def process2(path_l, peminer, ember, pestudio):
+    V, w, S = [], [], []
     x = 0
     label_table = read_label_csv(f"{path_l}")
     a = os.listdir(f"{peminer}")
@@ -252,9 +313,9 @@ def process1(path_l, peminer, ember, pestudio):
     a.extend(b)
     a.extend(c)
     all_files = set(a)
-    tf = TfidfVectorizer(analyzer="char", ngram_range=(3, 3))
     for fname in list(all_files):
         feature_vector = []
+        tmpvec = []
         strlist = ""
         lname = fname.split('.')[0]
         label = label_table[lname]
@@ -264,22 +325,68 @@ def process1(path_l, peminer, ember, pestudio):
                 if data == peminer:
                     feature_vector += PeminerParser(path).process_report()
                 elif data == ember:
-                    feature_vector, strlist = EmberParser(path).process_report()
-                    tmp = tf.fit_transform(strlist)
-                    feature_vector += tmp
+                    tmpvec = EmberParser(path).process_report()
+                    # feature_vector.extend(tmpvec)
+                    feature_vector += tmpvec
                 else:
                     feature_vector += PestudioParser(path).process_report()
             except FileNotFoundError:
-                pass
+                if data == peminer:
+                    feature_vector += [0 for i in range(188)]
+                elif data == ember:
+                    feature_vector += [0 for i in range(438)]
+                else:
+                    feature_vector += [0 for i in range(22)]
             except TypeError:
                 print(path)
+            except ValueError:
+                print('Error occured : ' + fname)
 
         V.append(feature_vector)
         w.append(label)
-    print(np.asarray(V).shape, np.asarray(w).shape)
+        x += 1
+        print("path_l count : " , x)
     return V, w
 
 
+def test_process(peminer, ember, pestudio):
+    V = []
+    x = 0
+    a = os.listdir(f"{peminer}")
+    b = os.listdir(f"{ember}")
+    c = os.listdir(f"{pestudio}")
+    a.extend(b)
+    a.extend(c)
+    all_files = set(a)
+    for fname in list(all_files):
+        feature_vector = []
+        lname = fname.split('.')[0]
+        for data in [peminer, ember, pestudio]:
+            path = f"{data}/{fname}"
+            try:
+                if data == peminer:
+                    feature_vector += PeminerParser(path).process_report()
+                elif data == ember:
+                    tmpvec = EmberParser(path).process_report()
+                    # feature_vector.extend(tmpvec)
+                    feature_vector += tmpvec
+                else:
+                    feature_vector += PestudioParser(path).process_report()
+            except FileNotFoundError:
+                if data == peminer:
+                    feature_vector += [0 for i in range(188)]
+                elif data == ember:
+                    feature_vector += [0 for i in range(438)]
+                else:
+                    feature_vector += [0 for i in range(22)]
+            except TypeError:
+                print(path)
+            except ValueError:
+                print('Error occured : ' + fname)
+        V.append(feature_vector)
+        x += 1
+        print("path_l count : " , x)
+    return V
 # %%
 """## 앙상블 예제"""
 
@@ -329,6 +436,32 @@ def select_feature(X, y, model):
     return rfe.fit_transform(X, y)
 
 
+def save_csv(filename, predict):
+    f = open('./predict.csv', 'w', encoding='utf-8', newline='')
+    wr = csv.writer(f)
+    wr.writerow(['file', 'predict'])
+
+    for idx in range(len(filename)):
+        wr.writerow([filename[idx][:-5], predict[idx]])
+
+    f.close()
+
+
+def save_ensemble_result(X, models, path=[]):
+
+    # Soft Voting
+    # https://devkor.tistory.com/entry/Soft-Voting-%EA%B3%BC-Hard-Voting
+    predicts = []
+    count = 0
+    for model in models:
+        prob = [result for _, result in model.predict_proba(X)]
+        predicts.append(prob)
+
+    predict = np.mean(predicts, axis=0)
+    predict = [1 if x >= 0.5 else 0 for x in predict]
+    save_csv(path, predict)
+
+
 if __name__ == '__main__':
     SEED = 41
     datapath = "../../../../Data/"
@@ -351,21 +484,22 @@ if __name__ == '__main__':
     train_ember = datapath + "EMBER/학습데이터"
     train_pestudio = datapath + "PESTUDIO/학습데이터"
 
-    # %%
-    X, y = process1(trainlabel, train_peminer, train_ember, train_pestudio)
-    """## 학습 및 검증"""
-    # %%
-    # 학습
-    models = []
-    for model in ["rf", "lgb"]:
-        clf = train(X, y, model)
-        models.append(clf)
+    X, y = process2(trainlabel, train_peminer, train_ember, train_pestudio)
+    testV = test_process(peminer, ember, pestudio)
 
+    aeee = np.asarray(X)
+    csr = csr_matrix(aeee)
+    models = []
+    for model in ["xg"]:
+        clf = train(csr, y, model)
+        models.append(clf)
+    save_ensemble_result(testV, models, os.listdir(peminer))
     # 검증
     # 실제 검증 시에는 제공한 검증데이터를 검증에 사용해야 함
+    CKX, CKY = process2(checklable, check_peminer, check_ember, check_pestudio)
     for model in models:
-        evaluate(X, y, model)
-    ensemble_result(X, y, models)
+        evaluate(CKX, CKY, model)
+    ensemble_result(CKX, CKY, models)
 
-    selected_X = select_feature(X, y, "rf")
-    new_model = train(selected_X, y, "rf")
+    # selected_X = select_feature(X, y, "rf")
+    # new_model = train(selected_X, y, "rf")
